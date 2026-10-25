@@ -65,19 +65,33 @@ jobs:
 
       - name: Package frontend build
         run: |
+          set -e
           test -f frontend/build/index.html
           tar -czf frontend-build.tar.gz \
             -C frontend/build .
 
-      - name: Check GitHub OIDC subject format
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_REF: ${{ github.ref }}
-          GH_EVENT_NAME: ${{ github.event_name }}
+      # Temporary diagnostic: prints only OIDC sub and aud claims.
+      - name: Inspect GitHub OIDC claims
+        shell: bash
         run: |
-          echo "Repository: $GH_REPOSITORY"
-          echo "Ref: $GH_REF"
-          echo "Event: $GH_EVENT_NAME"
+          set -euo pipefail
+
+          RESPONSE=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          TOKEN=$(printf '%s' "$RESPONSE" | jq -er '.value')
+          PAYLOAD=$(printf '%s' "$TOKEN" | cut -d '.' -f 2 | tr '_-' '/+')
+
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+            1) echo "Invalid token payload"; exit 1 ;;
+          esac
+
+          printf '%s' "$PAYLOAD" | base64 -d | jq '{sub, aud}'
+
+          unset TOKEN PAYLOAD RESPONSE
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -90,6 +104,7 @@ jobs:
 
       - name: Upload deployment artifacts to S3
         run: |
+          set -e
           aws s3 cp app-deploy.tar.gz \
             "s3://${S3_BUCKET}/deployments/${GITHUB_SHA}.tar.gz"
 
@@ -112,7 +127,10 @@ jobs:
       - name: Create deployment script
         env:
           DEPLOY_SHA: ${{ github.sha }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           cat > deploy-ec2.sh <<'SCRIPT'
           #!/bin/bash
           set -euo pipefail
@@ -183,6 +201,8 @@ jobs:
       - name: Send deployment command
         id: deploy
         run: |
+          set -euo pipefail
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name AWS-RunShellScript \
@@ -197,6 +217,8 @@ jobs:
         env:
           COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
         run: |
+          set -euo pipefail
+
           for i in $(seq 1 36); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \

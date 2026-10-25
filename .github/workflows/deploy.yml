@@ -1,0 +1,73 @@
+name: CI/CD - Build and Deploy to EC2
+
+# Runs on every push to main. Tests/builds first, then SSHes into EC2
+# and pulls + restarts the app. This is the automated version of the
+# manual steps in docs/EC2_DEPLOYMENT.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # --- Backend ---
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test --if-present
+
+      # --- Frontend ---
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          REACT_APP_API_URL: /api
+        run: npm run build
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    # Only deploy from main, never from a PR or manual branch build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/app
+            git pull origin main
+
+            # Backend: install prod deps and restart via PM2
+            cd backend
+            npm ci --omit=dev
+            pm2 restart crud-api || pm2 start src/server.js --name crud-api
+            pm2 save
+
+            # Frontend: rebuild static assets served by Nginx
+            cd ../frontend
+            npm ci
+            REACT_APP_API_URL=/api npm run build
+
+            # Reload Nginx to be safe
+            sudo systemctl reload nginx

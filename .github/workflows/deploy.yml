@@ -53,17 +53,15 @@ jobs:
           REACT_APP_API_URL: /api
         run: npm run build
 
+      
       - name: Package application source
         run: |
           tar -czf app-deploy.tar.gz \
-            --exclude='./.git' \
-            --exclude='./.github' \
             --exclude='node_modules' \
-            --exclude='*/node_modules' \
             --exclude='.env' \
-            --exclude='*/.env' \
-            --exclude='frontend/build' \
-            --exclude='*/build' \
+            --exclude='build' \
+            --exclude='.git' \
+            backend frontend database
             .
 
       - name: Package frontend build

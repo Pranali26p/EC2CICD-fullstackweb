@@ -1,37 +1,49 @@
-name: CI/CD - Build and Deploy to EC2
 
-# Runs on every push to main. Tests/builds first, then SSHes into EC2
-# and pulls + restarts the app. This is the automated version of the
-# manual steps in docs/EC2_DEPLOYMENT.md.
+name: CI/CD - Build and Deploy to EC2
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch: {}
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  EC2_INSTANCE_ID: i-080e2e8795ca4afb5
+  S3_BUCKET: pranali-ec2cicd-deploy-672120082802
+  APP_DIR: /home/ec2-user/app
 
 jobs:
   build-and-test:
+    name: Build and Test
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
 
-      # --- Backend ---
-      - name: Install backend deps
+      - name: Install backend dependencies
         working-directory: backend
         run: npm ci
 
       - name: Run backend tests
         working-directory: backend
-        run: npm test --if-present
+        run: npm test
 
-      # --- Frontend ---
-      - name: Install frontend deps
+      - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
@@ -41,33 +53,173 @@ jobs:
           REACT_APP_API_URL: /api
         run: npm run build
 
+      - name: Package application source
+        run: |
+          tar -czf app-deploy.tar.gz \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='node_modules' \
+            --exclude='*/node_modules' \
+            --exclude='.env' \
+            --exclude='*/.env' \
+            --exclude='frontend/build' \
+            --exclude='*/build' \
+            .
+
+      - name: Package frontend build
+        run: |
+          test -f frontend/build/index.html
+          tar -czf frontend-build.tar.gz \
+            -C frontend/build .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::672120082802:role/GitHubActions-EC2-Deploy-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Upload deployment artifacts to S3
+        run: |
+          aws s3 cp app-deploy.tar.gz \
+            "s3://${S3_BUCKET}/deployments/${GITHUB_SHA}.tar.gz"
+
+          aws s3 cp frontend-build.tar.gz \
+            "s3://${S3_BUCKET}/deployments/${GITHUB_SHA}-frontend.tar.gz"
+
   deploy:
+    name: Deploy to EC2 through SSM
     needs: build-and-test
     runs-on: ubuntu-latest
-    # Only deploy from main, never from a PR or manual branch build
     if: github.ref == 'refs/heads/main'
+
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -e
-            cd ~/app
-            git pull origin main
+          role-to-assume: arn:aws:iam::672120082802:role/GitHubActions-EC2-Deploy-Role
+          aws-region: ${{ env.AWS_REGION }}
 
-            # Backend: install prod deps and restart via PM2
-            cd backend
-            npm ci --omit=dev
-            pm2 restart crud-api || pm2 start src/server.js --name crud-api
-            pm2 save
+      - name: Create deployment script
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          cat > deploy-ec2.sh <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
 
-            # Frontend: rebuild static assets served by Nginx
-            cd ../frontend
-            npm ci
-            REACT_APP_API_URL=/api npm run build
+          DEPLOY_DIR="__DEPLOY_DIR__"
+          APP_DIR="__APP_DIR__"
+          S3_BUCKET="__S3_BUCKET__"
 
-            # Reload Nginx to be safe
-            sudo systemctl reload nginx
+          trap 'rm -rf "$DEPLOY_DIR"' EXIT
+
+          mkdir -p "$DEPLOY_DIR/source" "$DEPLOY_DIR/frontend"
+
+          aws s3 cp \
+            "s3://${S3_BUCKET}/deployments/__DEPLOY_SHA__.tar.gz" \
+            "$DEPLOY_DIR/app.tar.gz"
+
+          aws s3 cp \
+            "s3://${S3_BUCKET}/deployments/__DEPLOY_SHA__-frontend.tar.gz" \
+            "$DEPLOY_DIR/frontend.tar.gz"
+
+          tar -xzf "$DEPLOY_DIR/app.tar.gz" -C "$DEPLOY_DIR/source"
+          tar -xzf "$DEPLOY_DIR/frontend.tar.gz" -C "$DEPLOY_DIR/frontend"
+
+          test -f "$DEPLOY_DIR/source/backend/package.json"
+          test -f "$DEPLOY_DIR/source/backend/src/server.js"
+          test -f "$DEPLOY_DIR/frontend/index.html"
+
+          rsync -a \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            "$DEPLOY_DIR/source/backend/" "$APP_DIR/backend/"
+
+          chown -R ec2-user:ec2-user "$APP_DIR/backend"
+
+          sudo -iu ec2-user bash -lc \
+            "cd '$APP_DIR/backend' && npm ci --omit=dev"
+
+          sudo -iu ec2-user bash -lc \
+            "pm2 restart crud-api || pm2 start '$APP_DIR/backend/src/server.js' --name crud-api"
+
+          sudo -iu ec2-user bash -lc "pm2 save"
+
+          mkdir -p /var/www/crud-app
+          rsync -a --delete "$DEPLOY_DIR/frontend/" /var/www/crud-app/
+
+          nginx -t
+          systemctl reload nginx
+
+          curl -fsS http://localhost/ >/dev/null
+          curl -fsS http://localhost:5000/health
+
+          echo "Deployment completed successfully."
+          SCRIPT
+
+          sed -i \
+            -e "s|__DEPLOY_DIR__|/tmp/crud-deploy-${DEPLOY_SHA}|g" \
+            -e "s|__APP_DIR__|${APP_DIR}|g" \
+            -e "s|__S3_BUCKET__|${S3_BUCKET}|g" \
+            -e "s|__DEPLOY_SHA__|${DEPLOY_SHA}|g" \
+            deploy-ec2.sh
+
+          SCRIPT_B64=$(base64 -w 0 deploy-ec2.sh)
+
+          jq -n --arg cmd \
+            "echo '${SCRIPT_B64}' | base64 -d > /tmp/deploy-ec2.sh && bash /tmp/deploy-ec2.sh" \
+            '{commands: [$cmd]}' > commands.json
+
+      - name: Send deployment command
+        id: deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy ${GITHUB_SHA}" \
+            --parameters file://commands.json \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment
+        env:
+          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
+        run: |
+          for i in $(seq 1 36); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query StandardOutputContent \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,Error:StandardErrorContent,Output:StandardOutputContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Deployment is still running. Check the SSM command in AWS."
+          exit 1

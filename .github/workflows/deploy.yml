@@ -53,16 +53,15 @@ jobs:
           REACT_APP_API_URL: /api
         run: npm run build
 
-      
       - name: Package application source
         run: |
+          set -e
           tar -czf app-deploy.tar.gz \
             --exclude='node_modules' \
             --exclude='.env' \
             --exclude='build' \
             --exclude='.git' \
             backend frontend database
-            .
 
       - name: Package frontend build
         run: |
@@ -112,7 +111,7 @@ jobs:
           APP_DIR="__APP_DIR__"
           S3_BUCKET="__S3_BUCKET__"
 
-          trap 'rm -rf "$DEPLOY_DIR"' EXIT
+          trap 'rm -rf "$DEPLOY_DIR" /tmp/deploy-ec2.sh' EXIT
 
           mkdir -p "$DEPLOY_DIR/source" "$DEPLOY_DIR/frontend"
 
